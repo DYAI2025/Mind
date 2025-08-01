@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Back
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, constr, root_validator, validator
+from pydantic import BaseModel, constr, field_validator, model_validator
 from agent_manager import create_agent
 
 app = FastAPI(openapi_tags=[
@@ -25,6 +25,9 @@ app = FastAPI(openapi_tags=[
 # in-memory anchor storage
 anchors: Dict[str, Dict] = {}
 update_clients: List[WebSocket] = []
+
+# in-memory knowledge storage (in production this would be a database)
+knowledge_store: Dict[str, Dict] = {}
 
 # runtime management for functions
 processes: Dict[str, asyncio.subprocess.Process] = {}
@@ -129,21 +132,21 @@ class AgentAction(BaseModel):
     identity: Optional[str] = None
     params: Optional[Dict] = None
 
-    @validator('op')
+    @field_validator('op')
+    @classmethod
     def validate_op(cls, v):
         if v not in {'connect', 'pause', 'delete'}:
             raise ValueError('invalid op')
         return v
 
-    @root_validator
-    def connect_requires_fields(cls, values):
-        if values.get('op') == 'connect':
-            if values.get('model') is None or values.get('params') is None:
+    @model_validator(mode='after')
+    def connect_requires_fields(self):
+        if self.op == 'connect':
+            if self.model is None or self.params is None:
                 raise ValueError('model and params required')
-        return values
+        return self
 
-    class Config:
-        extra = 'forbid'
+    model_config = {"extra": "forbid"}
 
 
 class NewAgent(BaseModel):
@@ -164,6 +167,25 @@ class LoginData(BaseModel):
     password: str
 
 
+# Knowledge Sharing Models
+class KnowledgeEntry(BaseModel):
+    id: Optional[str] = None
+    title: str
+    content: str
+    category: str  # 'semnet', 'thoughts', 'wiki', 'shared'
+    tags: List[str] = []
+    author: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    
+
+class KnowledgeQuery(BaseModel):
+    category: Optional[str] = None
+    tags: Optional[List[str]] = None
+    search: Optional[str] = None
+    author: Optional[str] = None
+
+
 @app.put("/anchors/{gpt_id}")
 async def upsert_anchor(gpt_id: str, anchor: AnchorIn):
     if not re.match(r"^[a-z0-9_-]{3,32}$", gpt_id):
@@ -173,7 +195,7 @@ async def upsert_anchor(gpt_id: str, anchor: AnchorIn):
         created_at = anchors[gpt_id]["created_at"]
     else:
         created_at = now
-    data = Anchor(**anchor.dict(), gpt_id=gpt_id, created_at=created_at).dict()
+    data = Anchor(**anchor.model_dump(), gpt_id=gpt_id, created_at=created_at).model_dump()
     anchors[gpt_id] = data
     return data
 
@@ -422,9 +444,232 @@ async def env_status():
             out[entry['name']] = missing
     return out
 
+
+# Knowledge Sharing API
+@app.post("/knowledge", tags=["knowledge"])
+async def store_knowledge(entry: KnowledgeEntry) -> KnowledgeEntry:
+    """Store a knowledge entry that can be shared with all connected AIs"""
+    entry_id = entry.id or hashlib.md5(f"{entry.title}_{entry.author}_{datetime.utcnow()}".encode()).hexdigest()[:16]
+    now = datetime.utcnow().isoformat()
+    
+    # Ensure datetime fields are strings
+    created_at = entry.created_at or now
+    if hasattr(created_at, 'isoformat'):
+        created_at = created_at.isoformat()
+        
+    knowledge_entry = {
+        "id": entry_id,
+        "title": entry.title,
+        "content": entry.content,
+        "category": entry.category,
+        "tags": entry.tags,
+        "author": entry.author,
+        "created_at": created_at,
+        "updated_at": now
+    }
+    
+    knowledge_store[entry_id] = knowledge_entry
+    
+    # Also save to appropriate file location for persistence
+    await _save_knowledge_to_file(knowledge_entry)
+    
+    return KnowledgeEntry(**knowledge_entry)
+
+
+@app.get("/knowledge", tags=["knowledge"])
+async def query_knowledge(
+    category: Optional[str] = None,
+    tags: Optional[str] = None,  # comma-separated
+    search: Optional[str] = None,
+    author: Optional[str] = None
+) -> List[KnowledgeEntry]:
+    """Query knowledge entries with optional filters"""
+    results = []
+    tag_list = tags.split(",") if tags else []
+    
+    for entry in knowledge_store.values():
+        # Apply filters
+        if category and entry["category"] != category:
+            continue
+        if author and entry["author"] != author:
+            continue
+        if tag_list and not any(tag.strip() in entry.get("tags", []) for tag in tag_list):
+            continue
+        if search and search.lower() not in entry["title"].lower() and search.lower() not in entry["content"].lower():
+            continue
+        
+        # Ensure datetime fields are strings before creating KnowledgeEntry
+        entry_copy = entry.copy()
+        for field in ["created_at", "updated_at"]:
+            if field in entry_copy and hasattr(entry_copy[field], 'isoformat'):
+                entry_copy[field] = entry_copy[field].isoformat()
+            
+        results.append(KnowledgeEntry(**entry_copy))
+    
+    return results
+
+
+@app.get("/knowledge/{entry_id}", tags=["knowledge"])
+async def get_knowledge(entry_id: str) -> KnowledgeEntry:
+    """Get a specific knowledge entry by ID"""
+    if entry_id not in knowledge_store:
+        raise HTTPException(status_code=404, detail="Knowledge entry not found")
+    
+    entry = knowledge_store[entry_id].copy()
+    
+    # Ensure datetime fields are strings
+    for field in ["created_at", "updated_at"]:
+        if field in entry and hasattr(entry[field], 'isoformat'):
+            entry[field] = entry[field].isoformat()
+    
+    return KnowledgeEntry(**entry)
+
+
+@app.put("/knowledge/{entry_id}", tags=["knowledge"])
+async def update_knowledge(entry_id: str, entry: KnowledgeEntry) -> KnowledgeEntry:
+    """Update an existing knowledge entry"""
+    if entry_id not in knowledge_store:
+        raise HTTPException(status_code=404, detail="Knowledge entry not found")
+    
+    now = datetime.utcnow().isoformat()
+    existing_entry = knowledge_store[entry_id]
+    
+    # Ensure datetime fields are strings
+    created_at = existing_entry["created_at"]
+    if hasattr(created_at, 'isoformat'):
+        created_at = created_at.isoformat()
+    
+    updated_entry = {
+        "id": entry_id,
+        "title": entry.title,
+        "content": entry.content,
+        "category": entry.category,
+        "tags": entry.tags,
+        "author": entry.author,
+        "created_at": created_at,
+        "updated_at": now
+    }
+    
+    knowledge_store[entry_id] = updated_entry
+    await _save_knowledge_to_file(updated_entry)
+    
+    return KnowledgeEntry(**updated_entry)
+
+
+@app.delete("/knowledge/{entry_id}", tags=["knowledge"])
+async def delete_knowledge(entry_id: str):
+    """Delete a knowledge entry"""
+    if entry_id not in knowledge_store:
+        raise HTTPException(status_code=404, detail="Knowledge entry not found")
+    
+    del knowledge_store[entry_id]
+    return {"message": "Knowledge entry deleted"}
+
+
+async def _save_knowledge_to_file(entry: Dict):
+    """Save knowledge entry to appropriate file location for persistence"""
+    import os
+    import yaml
+    
+    category = entry["category"]
+    entry_id = entry["id"]
+    
+    # Determine directory based on category
+    if category == "semnet":
+        directory = "semnet/core"
+    elif category == "thoughts":
+        directory = "thoughts/entries"
+    elif category == "wiki":
+        directory = "wiki/Narrative"
+    else:
+        directory = "wiki"  # Default for shared knowledge
+    
+    # Ensure directory exists
+    os.makedirs(directory, exist_ok=True)
+    
+    # Create filename from title (sanitized)
+    safe_title = "".join(c for c in entry["title"] if c.isalnum() or c in (' ', '-', '_')).rstrip()
+    safe_title = safe_title.replace(' ', '_')[:50]  # Limit length
+    filename = f"{safe_title}_{entry_id}.md"
+    filepath = os.path.join(directory, filename)
+    
+    # Create markdown content with YAML frontmatter
+    content = f"""---
+id: {entry['id']}
+title: {entry['title']}
+category: {entry['category']}
+tags: {entry['tags']}
+author: {entry['author']}
+created_at: {entry['created_at']}
+updated_at: {entry['updated_at']}
+---
+
+{entry['content']}
+"""
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+
+async def _load_existing_knowledge():
+    """Load existing knowledge from file system on startup"""
+    import os
+    import yaml
+    import re
+    
+    directories = [
+        ("semnet/core", "semnet"),
+        ("thoughts/entries", "thoughts"), 
+        ("wiki/Narrative", "wiki"),
+        ("wiki", "shared")
+    ]
+    
+    for directory, category in directories:
+        if not os.path.exists(directory):
+            continue
+            
+        for filename in os.listdir(directory):
+            if not filename.endswith('.md'):
+                continue
+                
+            filepath = os.path.join(directory, filename)
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Parse YAML frontmatter
+                if content.startswith('---'):
+                    parts = content.split('---', 2)
+                    if len(parts) >= 3:
+                        try:
+                            frontmatter = yaml.safe_load(parts[1])
+                            body = parts[2].strip()
+                            
+                            if frontmatter and isinstance(frontmatter, dict):
+                                entry_id = frontmatter.get('id') or hashlib.md5(filepath.encode()).hexdigest()[:16]
+                                knowledge_store[entry_id] = {
+                                    "id": entry_id,
+                                    "title": frontmatter.get('title', filename),
+                                    "content": body,
+                                    "category": frontmatter.get('category', category),
+                                    "tags": frontmatter.get('tags', []),
+                                    "author": frontmatter.get('author', 'system'),
+                                    "created_at": frontmatter.get('created_at', ''),
+                                    "updated_at": frontmatter.get('updated_at', '')
+                                }
+                        except yaml.YAMLError:
+                            pass  # Skip files with invalid YAML
+                            
+            except Exception:
+                pass  # Skip files that can't be read
+
 def start():
     port = int(os.environ.get("API_PORT") or os.environ.get("PORT", 8000))
     import uvicorn
+    
+    # Load existing knowledge on startup
+    asyncio.run(_load_existing_knowledge())
+    
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
