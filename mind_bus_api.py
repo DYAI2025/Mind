@@ -16,11 +16,13 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, constr, root_validator, validator
 from agent_manager import create_agent
+from wirklichkeits_api.hive_routes import router as hive_router
 
 app = FastAPI(openapi_tags=[
     {"name": "anchor", "x-openai-isConsequential": True},
     {"name": "action", "x-openai-isConsequential": True},
 ])
+app.include_router(hive_router)
 
 # in-memory anchor storage
 anchors: Dict[str, Dict] = {}
@@ -135,7 +137,7 @@ class AgentAction(BaseModel):
             raise ValueError('invalid op')
         return v
 
-    @root_validator
+    @root_validator(skip_on_failure=True)
     def connect_requires_fields(cls, values):
         if values.get('op') == 'connect':
             if values.get('model') is None or values.get('params') is None:
