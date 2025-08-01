@@ -12,3 +12,8 @@ __pycache__/
 # Sonstiges
 .DS_Store
 .env.*
+
+# Test generated files
+**/Test_Knowledge_Entry_*.md
+**/AI_Collaboration_Test_*.md
+.deps_installed
